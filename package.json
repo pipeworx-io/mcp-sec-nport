@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-sec-nport",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "SEC Form N-PORT — fund and ETF holdings, asked security-first.",
   "type": "module",
   "main": "src/index.ts",
@@ -24,5 +24,9 @@
   "devDependencies": {
     "typescript": "^5.9.3",
     "@cloudflare/workers-types": "^4.20260405.1"
+  },
+  "pipeworx": {
+    "sourceHash": "v1-3144e1f38647a6ca8cc107ec6023eb3f9a7b0248fb78be3c0f8cb07c68b7d34a",
+    "sourceCommit": "00c836ddeaecbdd581dcfb0fb1842efea104006e"
   }
 }

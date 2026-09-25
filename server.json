@@ -3,7 +3,7 @@
   "name": "io.github.pipeworx-io/sec-nport",
   "title": "Sec Nport",
   "description": "SEC Form N-PORT — fund and ETF holdings, asked security-first.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "websiteUrl": "https://pipeworx.io/packs/sec-nport",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-sec-nport",
