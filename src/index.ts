@@ -708,6 +708,18 @@ function collapse(s: string): string {
  *  - N-PORT has no ETF flag. A fund is a fund here; the series name is the only
  *    hint that one is an ETF, and responses say that rather than pretending to
  *    a classification the filing does not carry.
+ *
+ * FUND PROFILE (nport_fund_profile), fleet #3237 — DEEPENS this pack with SEC
+ * Form N-CEN, the annual fund census. N-PORT answers "what does this fund
+ * hold"; N-CEN answers "what IS this fund" — its ETF/index/money-market
+ * status (an explicit flag, unlike N-PORT), expense ratio, advisory fee, and
+ * investment adviser(s). N-CEN is filed ANNUALLY per fund (SEC still releases
+ * the data quarterly because fiscal year ends spread across the calendar), so
+ * a profile can be up to a year stale relative to its release quarter —
+ * every response carries report_ending_period rather than implying current.
+ * N-CEN's structured data carries NO inception date field at all (checked
+ * against SEC's own table definitions, not assumed); the profile says so
+ * rather than omitting it silently.
  */
 
 
@@ -727,6 +739,15 @@ const FUNDS = 'sec_nport_funds';
 // One row per (cusip, issuer_name) — the resolve target, NOT the holdings heap.
 // See resolveTicker below and migration 159.
 const SECURITIES = 'sec_nport_securities';
+// N-CEN fund profile and adviser tables (migration 258, fleet #3237) — a
+// separate filing family from N-PORT, see the header comment.
+const NCEN_FUNDS = 'sec_ncen_funds';
+const NCEN_ADVISERS = 'sec_ncen_advisers';
+// Part F — unit investment trusts (migration 261, fleet #3287). SPY, QQQ,
+// DIA and similar report here instead of NCEN_FUNDS; see fundProfile()'s
+// fallback below.
+const NCEN_UITS = 'sec_ncen_uits';
+const NCEN_UIT_ADMINS = 'sec_ncen_uit_admins';
 
 async function pg<T>(cfg: Cfg, table: string, query: string): Promise<T> {
   const res = await pwFetch(`${cfg.url}/rest/v1/${table}?${query}`, {
@@ -844,6 +865,307 @@ const SCOPE =
 
 const ETF_NOTE =
   'N-PORT carries no ETF flag — these are registered funds, which include both ETFs and mutual funds. The series name is the only hint, so an ETF-only answer cannot be given honestly from this filing.';
+
+const PROFILE_SCOPE =
+  'N-CEN is filed annually, once per fund per fiscal year — SEC still releases the data quarterly because fiscal year ends are spread across the calendar, so this profile can be up to a year stale relative to the release quarter. report_ending_period is the fund\'s own fiscal year end, not today. N-CEN\'s structured data carries no inception date field, so this pack cannot answer when a fund started.';
+
+/**
+ * Verified against SEC's own 2026q1 N-CEN release (fleet #3237, then #3287):
+ * SPDR S&P 500 ETF Trust (SPY, CIK 884394) DOES file Form N-CEN — accession
+ * 0001410368-26-023904, filed 2026-03-13 — but as a UNIT INVESTMENT TRUST its
+ * fund-level data is reported through N-CEN's Part F / UIT.tsv table
+ * (EXISTING_SERIES_CNT, TOTAL_ASSET_FOR_ALL_SERIES = 712,072,540,255.17 for
+ * SPY, keyed by ACCESSION_NUMBER only), not through Part C/D's
+ * FUND_REPORTED_INFO.tsv, and has ZERO rows there. nport_fund_profile now
+ * reads BOTH: Part C/D first, falling back to Part F (sec_ncen_uits /
+ * sec_ncen_uit_admins, migration 261) when nothing matches there. A UIT
+ * profile carries no expense ratio, advisory fee, or NAV/market price — Part
+ * F does not report those items at all — and `administrators` stands in for
+ * `advisers` (a UIT has no investment adviser in the usual sense; it is
+ * passively administered). SPY's N-PORT HOLDINGS remain separately covered
+ * via nport_fund_portfolio/nport_fund_owners (confirmed live: sec_nport_funds
+ * carries SPY under registrant "State Street(R) SPDR(R) S&P 500(R) ETF
+ * Trust", series_name "N/A").
+ */
+const UIT_PROFILE_NOTE =
+  'Unit investment trusts report a different N-CEN section (Part F) than management-investment-company funds (Part C/D) and it carries different fields: total assets across all the registrant\'s series, administrator(s), and series count — no expense ratio, advisory fee, or NAV/market price per share are reported here at all.';
+
+const NO_MATCH_HINT =
+  'No N-CEN filer matched this name in the loaded releases, in either the management-investment-company section (Part C/D) or the unit investment trust section (Part F). Only SEC-registered funds file N-CEN. Try nport_fund_portfolio first to confirm the fund\'s exact filed name.';
+
+const FUND_SUFFIX_WORDS = new Set([
+  'ETF', 'ETMF', 'FUND', 'FUNDS', 'TRUST', 'INC', 'INCORPORATED', 'CORP', 'CORPORATION',
+  'COMPANY', 'CO', 'LTD', 'LIMITED', 'PLC', 'THE', 'SERIES',
+]);
+
+/**
+ * Normalizes a fund name for MATCH-QUALITY comparison only (never for
+ * display or for the DB filter, which stays a raw ILIKE substring match).
+ * Strips trademark/registration marks and punctuation, then trims generic
+ * leading/trailing fund-type words so "SPDR S&P 500 ETF" and "SPDR S&P 500
+ * ETF Trust" normalize to the same thing. Only leading/trailing words are
+ * stripped, never interior ones — "Fund of Funds" must not collapse into
+ * "of", and two funds that differ only by an interior word must stay
+ * distinguishable.
+ */
+function normalizeFundName(raw: string): string {
+  const cleaned = raw
+    .toUpperCase()
+    .replace(/\(R\)|\(TM\)|[®™]/g, '')
+    .replace(/[^A-Z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const tokens = cleaned.split(' ').filter(Boolean);
+  while (tokens.length > 1 && FUND_SUFFIX_WORDS.has(tokens[tokens.length - 1])) tokens.pop();
+  while (tokens.length > 1 && FUND_SUFFIX_WORDS.has(tokens[0])) tokens.shift();
+  return tokens.join(' ');
+}
+
+type NameMatchGrade = 'exact' | 'starts_with' | 'contains' | 'other';
+
+/**
+ * THE #3169/#3182 CLASS OF BUG (fleet #3237 follow-up). Every candidate here
+ * already passed a raw `fund_name ILIKE '%query%'` filter, so every one of
+ * them literally contains the query text somewhere — "contains" is never
+ * false for a DB-returned row; the grades above it (exact, starts_with) are
+ * refinements that decide which of several containing-matches is actually
+ * the fund asked for, rather than whichever happened to sort first on an
+ * unrelated column (date). Graded on the NORMALIZED names so punctuation and
+ * a trailing "ETF"/"Trust"/"Fund" do not block an otherwise-exact match.
+ */
+function nameMatchGrade(query: string, candidateName: string | null): NameMatchGrade {
+  const nq = normalizeFundName(query);
+  const nc = normalizeFundName(candidateName ?? '');
+  if (!nq || !nc) return 'other';
+  if (nc === nq) return 'exact';
+  if (nc.startsWith(nq) || nq.startsWith(nc)) return 'starts_with';
+  if (nc.includes(nq)) return 'contains';
+  return 'other';
+}
+
+const GRADE_RANK: Record<NameMatchGrade, number> = { exact: 0, starts_with: 1, contains: 2, other: 3 };
+
+interface NcenFundRow {
+  fund_id: string;
+  accession_number: string;
+  cik: string | null;
+  series_id: string | null;
+  fund_name: string | null;
+  registrant_name: string | null;
+  is_etf: boolean | null;
+  is_etmf: boolean | null;
+  is_index: boolean | null;
+  is_money_market: boolean | null;
+  is_target_date: boolean | null;
+  is_fund_of_fund: boolean | null;
+  is_master_feeder: boolean | null;
+  management_fee_pct: number | null;
+  net_operating_expenses_pct: number | null;
+  market_price_per_share: number | null;
+  nav_per_share: number | null;
+  monthly_avg_net_assets: number | null;
+  daily_avg_net_assets: number | null;
+  report_ending_period: string | null;
+  filing_date: string | null;
+  quarter: string | null;
+}
+
+interface NcenAdviserRow {
+  adviser_type: string;
+  adviser_name: string;
+  crd_num: string | null;
+  adviser_lei: string | null;
+  state: string | null;
+  country: string | null;
+  is_affiliated: boolean | null;
+}
+
+function fundTypeLabel(f: NcenFundRow): string {
+  const flags: string[] = [];
+  if (f.is_etf) flags.push('ETF');
+  if (f.is_etmf) flags.push('exchange-traded managed fund');
+  if (f.is_index) flags.push('index fund');
+  if (f.is_money_market) flags.push('money market fund');
+  if (f.is_target_date) flags.push('target-date fund');
+  if (f.is_fund_of_fund) flags.push('fund of funds');
+  if (f.is_master_feeder) flags.push('master/feeder structure');
+  return flags.length ? flags.join(', ') : 'registered fund (no special-purpose flag filed)';
+}
+
+interface NcenUitRow {
+  accession_number: string;
+  cik: string | null;
+  registrant_name: string | null;
+  series_id: string | null;
+  existing_series_cnt: number | null;
+  new_series_cnt: number | null;
+  total_assets_all_series: number | null;
+  report_ending_period: string | null;
+  filing_date: string | null;
+  quarter: string | null;
+}
+
+interface NcenUitAdminRow {
+  admin_name: string;
+  admin_lei: string | null;
+  other_identifying_num: string | null;
+  state: string | null;
+  country: string | null;
+  is_affiliated: boolean | null;
+  is_sub_admin: boolean | null;
+}
+
+async function fundProfileFromUits(cfg: Cfg, name: string) {
+  // Same candidate-pool / ranking discipline as the management-company path
+  // above — a UIT lookup is no less entitled to "exact beats contains" than
+  // the first table is.
+  const raw = await pg<NcenUitRow[]>(
+    cfg, NCEN_UITS,
+    `select=accession_number,cik,registrant_name,series_id,existing_series_cnt,new_series_cnt,total_assets_all_series,report_ending_period,filing_date,quarter&registrant_name=ilike.*${encodeURIComponent(name)}*&order=report_ending_period.desc.nullslast&limit=25`,
+  );
+  if (!raw.length) return null;
+
+  const graded = raw
+    .map((m) => ({ row: m, grade: nameMatchGrade(name, m.registrant_name) }))
+    .sort((a, b) => GRADE_RANK[a.grade] - GRADE_RANK[b.grade]);
+  const { row: uit, grade: topGrade } = graded[0];
+
+  const admins = await pg<NcenUitAdminRow[]>(
+    cfg, NCEN_UIT_ADMINS,
+    `select=admin_name,admin_lei,other_identifying_num,state,country,is_affiliated,is_sub_admin&accession_number=eq.${encodeURIComponent(uit.accession_number)}&limit=20`,
+  ).catch(() => [] as NcenUitAdminRow[]);
+
+  return {
+    found: true,
+    fund: uit.registrant_name ?? name,
+    name_match: topGrade,
+    ...(topGrade !== 'exact'
+      ? { name_match_note: `No exact (or prefix) name match for "${name}" — this is the closest match found (${topGrade}), not necessarily the fund you meant. See other_candidates.` }
+      : {}),
+    registrant: uit.registrant_name,
+    cik: uit.cik,
+    series_id: uit.series_id,
+    fund_type: 'unit investment trust',
+    aum_usd: uit.total_assets_all_series,
+    aum_basis: 'total_assets_all_series',
+    existing_series_count: uit.existing_series_cnt,
+    // Part F reports none of these items at all — explicit null, not a
+    // query that came back empty, and the note says why.
+    expense_ratio_pct: null,
+    management_fee_pct: null,
+    nav_per_share: null,
+    market_price_per_share: null,
+    uit_profile_note: UIT_PROFILE_NOTE,
+    inception_date: null,
+    inception_date_note: 'Not available — SEC Form N-CEN structured data carries no inception date field.',
+    administrators: admins.map((a) => ({
+      name: a.admin_name,
+      lei: a.admin_lei,
+      other_identifying_num: a.other_identifying_num,
+      state: a.state,
+      country: a.country,
+      affiliated: a.is_affiliated,
+      sub_admin: a.is_sub_admin,
+    })),
+    as_of_period: uit.report_ending_period,
+    filing_date: uit.filing_date,
+    release: uit.quarter,
+    other_candidates: graded.slice(1, 6).map((g) => ({
+      fund_name: g.row.registrant_name,
+      registrant: g.row.registrant_name,
+      name_match: g.grade,
+    })),
+    scope: PROFILE_SCOPE,
+    source: 'SEC Form N-CEN structured data (Part F — unit investment trust census)',
+  };
+}
+
+async function fundProfile(args: Record<string, unknown>) {
+  const cfg = cfgOf(args);
+  const name = String(args.fund ?? '').trim();
+  if (!name) throw new Error('user_error: `fund` is required — a fund or ETF name.');
+
+  // Part C/D (management-investment-company funds) first, same as before. A
+  // wide candidate pool, NOT limit 5 — the point of ranking client-side is
+  // that the right answer can be buried behind several other containing
+  // matches, and a narrow DB limit can cut it before ranking ever sees it.
+  // Ordered by date only as a tie-break for candidates that grade equally;
+  // Array#sort is stable, so that ordering survives the grade-sort below.
+  const raw = await pg<NcenFundRow[]>(
+    cfg, NCEN_FUNDS,
+    `select=fund_id,accession_number,cik,series_id,fund_name,registrant_name,is_etf,is_etmf,is_index,is_money_market,is_target_date,is_fund_of_fund,is_master_feeder,management_fee_pct,net_operating_expenses_pct,market_price_per_share,nav_per_share,monthly_avg_net_assets,daily_avg_net_assets,report_ending_period,filing_date,quarter&fund_name=ilike.*${encodeURIComponent(name)}*&order=report_ending_period.desc.nullslast&limit=25`,
+  );
+
+  if (!raw.length) {
+    // Part F fallback (fleet #3287) — SPY, QQQ, DIA and similar unit
+    // investment trusts have no FUND_REPORTED_INFO rows at all, so they only
+    // ever reach this branch.
+    const uitResult = await fundProfileFromUits(cfg, name);
+    if (uitResult) return uitResult;
+
+    return {
+      found: false,
+      fund: name,
+      reason: 'no_such_fund',
+      hint: NO_MATCH_HINT,
+      scope: PROFILE_SCOPE,
+      source: 'SEC Form N-CEN structured data',
+    };
+  }
+
+  const graded = raw
+    .map((m) => ({ row: m, grade: nameMatchGrade(name, m.fund_name) }))
+    .sort((a, b) => GRADE_RANK[a.grade] - GRADE_RANK[b.grade]);
+  const { row: fund, grade: topGrade } = graded[0];
+
+  const advisers = await pg<NcenAdviserRow[]>(
+    cfg, NCEN_ADVISERS,
+    `select=adviser_type,adviser_name,crd_num,adviser_lei,state,country,is_affiliated&fund_id=eq.${encodeURIComponent(fund.fund_id)}&limit=20`,
+  ).catch(() => [] as NcenAdviserRow[]);
+
+  return {
+    found: true,
+    fund: fund.fund_name ?? name,
+    // NEVER present a contains-match as THE fund without saying so: the
+    // grade travels on every response, and a non-exact grade also carries an
+    // explicit note rather than leaving the caller to infer it.
+    name_match: topGrade,
+    ...(topGrade !== 'exact'
+      ? { name_match_note: `No exact (or prefix) name match for "${name}" — this is the closest match found (${topGrade}), not necessarily the fund you meant. See other_candidates.` }
+      : {}),
+    registrant: fund.registrant_name,
+    cik: fund.cik,
+    series_id: fund.series_id,
+    fund_type: fundTypeLabel(fund),
+    aum_usd: fund.monthly_avg_net_assets ?? fund.daily_avg_net_assets,
+    aum_basis: fund.monthly_avg_net_assets != null ? 'monthly_average_net_assets' : fund.daily_avg_net_assets != null ? 'daily_average_net_assets_money_market' : null,
+    expense_ratio_pct: fund.net_operating_expenses_pct,
+    management_fee_pct: fund.management_fee_pct,
+    nav_per_share: fund.nav_per_share,
+    market_price_per_share: fund.market_price_per_share,
+    inception_date: null,
+    inception_date_note: 'Not available — SEC Form N-CEN structured data carries no inception date field.',
+    advisers: advisers.map((a) => ({
+      name: a.adviser_name,
+      type: a.adviser_type,
+      crd_number: a.crd_num,
+      lei: a.adviser_lei,
+      state: a.state,
+      country: a.country,
+      affiliated: a.is_affiliated,
+    })),
+    as_of_period: fund.report_ending_period,
+    filing_date: fund.filing_date,
+    release: fund.quarter,
+    other_candidates: graded.slice(1, 6).map((g) => ({
+      fund_name: g.row.fund_name,
+      registrant: g.row.registrant_name,
+      name_match: g.grade,
+    })),
+    scope: PROFILE_SCOPE,
+    source: 'SEC Form N-CEN structured data',
+  };
+}
 
 const ASSET_CATS: Record<string, string> = { EC: 'equity-common', EP: 'equity-preferred', DBT: 'debt' };
 
@@ -1015,13 +1337,47 @@ async function countRows(cfg: Cfg, table: string, filter: string): Promise<numbe
   return total === undefined || total === '*' ? null : Number(total);
 }
 
+/**
+ * THE COVERAGE-UNDER-REPORT BUG (fleet #3237 follow-up). This used to be
+ * `select=quarter&order=quarter.desc&limit=1000` fed through a client-side
+ * `new Set()` — which is exactly the 1,000-row page cap `countRows` above is
+ * already written to avoid, just not avoided HERE. With 4 releases loaded
+ * and one of them (2026q3) alone holding >1,000 rows, `order=quarter.desc`
+ * puts that release's rows first, the page fills with nothing but
+ * "2026q3", and the three OTHER loaded releases never appear in the page at
+ * all — reported live as `releases_loaded: ["2026q3"]` while all four
+ * quarters were actually loaded and answering lookups. A page is not the
+ * whole table; this pages all the way through with the `Range` header
+ * (PostgREST's own pagination contract) so the distinct set is built from
+ * every row, not the first page of them. A table this small (tens of
+ * thousands of rows, a handful of distinct quarters) makes this cheap: a
+ * few requests, not one per row.
+ */
+async function distinctReleases(cfg: Cfg, table: string): Promise<string[]> {
+  const seen = new Set<string>();
+  const PAGE = 1000;
+  const MAX_PAGES = 50; // 50k rows of headroom — a safety bound, not a real limit.
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const offset = page * PAGE;
+    const res = await pwFetch(`${cfg.url}/rest/v1/${table}?select=quarter&order=quarter.desc`, {
+      headers: {
+        apikey: cfg.key,
+        Authorization: `Bearer ${cfg.key}`,
+        Range: `${offset}-${offset + PAGE - 1}`,
+      },
+    });
+    if (!res.ok) break;
+    const rows = (await res.json()) as Array<{ quarter: string | null }>;
+    for (const r of rows) if (r.quarter) seen.add(r.quarter);
+    if (rows.length < PAGE) break;
+  }
+  return [...seen].sort().reverse();
+}
+
 async function coverage(args: Record<string, unknown>) {
   const cfg = cfgOf(args);
   const newest = await pg<FundRow[]>(cfg, FUNDS, 'select=report_period&order=report_period.desc&limit=1');
-  const releaseRows = await pg<Array<{ quarter: string | null }>>(
-    cfg, FUNDS, 'select=quarter&order=quarter.desc&limit=1000',
-  );
-  const releases = [...new Set(releaseRows.map((r) => r.quarter).filter((q): q is string => !!q))].sort().reverse();
+  const releases = await distinctReleases(cfg, FUNDS);
 
   const per = await Promise.all(
     releases.map(async (q) => ({
@@ -1031,6 +1387,18 @@ async function coverage(args: Record<string, unknown>) {
     })),
   );
   const incomplete = per.some((r) => r.funds === null || r.holdings === null);
+
+  const ncenReleases = await distinctReleases(cfg, NCEN_FUNDS).catch(() => [] as string[]);
+  const ncenTotalFunds = ncenReleases.length
+    ? (await Promise.all(ncenReleases.map((q) => countRows(cfg, NCEN_FUNDS, `quarter=eq.${encodeURIComponent(q)}&`))))
+        .reduce<number | null>((s, n) => (s === null || n === null ? null : s + n), 0)
+    : 0;
+
+  const ncenUitReleases = await distinctReleases(cfg, NCEN_UITS).catch(() => [] as string[]);
+  const ncenTotalUits = ncenUitReleases.length
+    ? (await Promise.all(ncenUitReleases.map((q) => countRows(cfg, NCEN_UITS, `quarter=eq.${encodeURIComponent(q)}&`))))
+        .reduce<number | null>((s, n) => (s === null || n === null ? null : s + n), 0)
+    : 0;
 
   return {
     source: 'SEC Form N-PORT structured data',
@@ -1048,6 +1416,19 @@ async function coverage(args: Record<string, unknown>) {
       'Funds file N-PORT monthly; SEC releases the data publicly once a quarter, roughly 60 days after the quarter ends. The as-of period on every answer is the filing date, not today.',
     scope: SCOPE,
     etf_note: ETF_NOTE,
+    fund_profile_coverage: {
+      source: 'SEC Form N-CEN structured data (nport_fund_profile)',
+      releases_loaded: ncenReleases,
+      total_fund_profiles: ncenTotalFunds,
+      cadence: 'N-CEN is filed annually per fund; SEC releases the data quarterly because fiscal year ends spread across the calendar, so a single release covers only the funds whose fiscal year ended in that window. Several loaded releases are needed for broad coverage.',
+      scope: PROFILE_SCOPE,
+      unit_investment_trusts: {
+        source: 'SEC Form N-CEN Part F structured data (SPY, QQQ, DIA and similar — nport_fund_profile falls back here)',
+        releases_loaded: ncenUitReleases,
+        total_uits: ncenTotalUits,
+        scope: UIT_PROFILE_NOTE,
+      },
+    },
   };
 }
 
@@ -1083,8 +1464,20 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'nport_holdings_coverage',
     description:
-      'Which SEC Form N-PORT releases are loaded, how many funds each carries, the newest reporting period, and what the data does and does not cover. Use this to check how current fund holdings answers are before quoting them.',
+      'Which SEC Form N-PORT releases are loaded, how many funds each carries, the newest reporting period, and what the data does and does not cover. Also reports N-CEN fund-profile coverage (nport_fund_profile). Use this to check how current fund holdings and profile answers are before quoting them.',
     inputSchema: { type: 'object' as const, properties: {} },
+  },
+  {
+    name: 'nport_fund_profile',
+    description:
+      'A mutual fund or ETF\'s profile from SEC Form N-CEN, the annual fund census: ETF/index/money-market status (an explicit flag, which N-PORT holdings filings do not carry), AUM, expense ratio, advisory fee, NAV and market price per share, and its investment adviser(s). Also covers ETFs organized as unit investment trusts (SPY, QQQ, DIA) via N-CEN\'s separate UIT section — fund_type "unit investment trust", total assets, and administrator(s), but no expense ratio/advisory fee/NAV (Part F does not report those). Give the fund or ETF name ("Vanguard Total Stock Market Index Fund", "SPDR S&P 500 ETF Trust"). Answers "is this fund an ETF", "what\'s this fund\'s expense ratio", "who manages this fund", "how big is this fund\'s AUM". Does NOT cover inception date — N-CEN carries no such field — or portfolio holdings (use nport_fund_portfolio for that). Response discloses a name_match grade (exact/starts_with/contains) and other candidates, since a substring match is never presented as the fund without saying so.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        fund: { type: 'string', description: 'Fund or ETF name, or a fragment of it.' },
+      },
+      required: ['fund'],
+    },
   },
 ];
 
@@ -1093,6 +1486,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
     case 'nport_fund_owners': return fundOwners(args);
     case 'nport_fund_portfolio': return fundPortfolio(args);
     case 'nport_holdings_coverage': return coverage(args);
+    case 'nport_fund_profile': return fundProfile(args);
     default: throw new Error(`Unknown tool: ${name}`);
   }
 }

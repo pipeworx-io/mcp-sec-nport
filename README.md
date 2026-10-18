@@ -1,14 +1,16 @@
 # @pipeworx/sec-nport
 
-Mutual fund and ETF portfolio holdings, from SEC Form N-PORT. Keyless.
+Mutual fund and ETF portfolio holdings and fund profile, from SEC Form N-PORT
+and Form N-CEN. Keyless.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1683+ live data sources.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1831+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Tools
 
 - `nport_fund_owners(security, quarter?, limit?)` — which funds and ETFs hold a stock or bond, ranked by position size. Takes a ticker, a company name, or a CUSIP.
 - `nport_fund_portfolio(fund, quarter?, limit?)` — one fund's reported positions, largest first.
-- `nport_holdings_coverage()` — which releases are loaded, how current they are, and what the data does not cover.
+- `nport_fund_profile(fund)` — a fund's profile: ETF/index/money-market status, AUM, expense ratio, advisory fee, NAV/market price per share, and investment adviser(s). From SEC Form N-CEN, the annual fund census — see "Fund profile" below.
+- `nport_holdings_coverage()` — which N-PORT and N-CEN releases are loaded, how current they are, and what the data does not cover.
 
 ## The inversion is the point of this pack
 
@@ -68,6 +70,67 @@ database and the cold-quarter split should be built rather than discussed. `sec_
 sits at 3.8M rows for comparison — this pack is the same order of magnitude, not a new class
 of problem.
 
+## Fund profile, from a different filing (N-CEN, not N-PORT)
+
+`nport_fund_profile` answers a different question than the other three tools:
+not "what does this fund hold" but "what *is* this fund". It reads SEC Form
+N-CEN, the annual fund census, which carries fields N-PORT's holdings filing
+does not:
+
+- An **explicit ETF/exchange-traded-managed-fund/index/money-market/target-date
+  flag** — N-PORT has none of these; the series name is the only hint there.
+- **Expense ratio** (net annual operating expenses, percent of net assets) and
+  **advisory fee** — populated mainly for **closed-end funds**; most open-end
+  funds and ETFs leave these N-CEN items blank, and the tool reports that as
+  `null`, never `0`.
+- **Investment adviser(s)**, by name, CRD number and LEI, including
+  subadvisers.
+- **AUM** (monthly average net assets, or daily average for money market
+  funds) and **NAV/market price per share**.
+
+**What it cannot answer: inception date.** N-CEN's structured data set carries
+no such field — checked against SEC's own 53-table schema
+(`ncen_readme.pdf`) before this was built, not assumed. Every response says so
+explicitly rather than omitting the field.
+
+**Why this can be a year stale.** N-CEN is filed **annually**, once per fund
+per fiscal year. SEC still releases the structured data quarterly because
+funds' fiscal year ends are spread across the calendar — one release quarter
+alone covers only the funds whose year ended in that window (measured against
+the live 2026q3 release: 2,330 of roughly 9-10k active funds). The ingest
+script loads a trailing four-quarter window for near-complete single-year
+coverage. `report_ending_period` on every response is the fund's own fiscal
+year end, not today.
+
+**ETFs organized as unit investment trusts (SPY, QQQ, DIA) ARE covered, through
+a separate N-CEN section.** A UIT reports its fund-level data through N-CEN's
+Part F / `UIT.tsv` table (`EXISTING_SERIES_CNT`, `TOTAL_ASSET_FOR_ALL_SERIES`,
+keyed by accession only, no per-series row) rather than through Part C/D's
+`FUND_REPORTED_INFO.tsv`. `nport_fund_profile` tries Part C/D first and falls
+back to the UIT table when nothing matches there — verified live against
+SPDR S&P 500 ETF Trust (SPY, CIK 884394): its 2026 filing (accession
+0001410368-26-023904) carries zero `FUND_REPORTED_INFO` rows but a `UIT.tsv`
+row reporting `TOTAL_ASSET_FOR_ALL_SERIES` of $712,072,540,255.17. A UIT
+profile returns `fund_type: "unit investment trust"`, total assets, and
+`administrators` (a UIT has no investment adviser in the usual sense — it is
+passively administered) — but no expense ratio, advisory fee, or NAV/market
+price, because Part F does not report those items at all; `uit_profile_note`
+says so on every UIT response. Its N-PORT **holdings** are separately and
+fully covered by `nport_fund_portfolio`/`nport_fund_owners` (confirmed live:
+SPY is in `sec_nport_funds` under registrant "State Street(R) SPDR(R) S&P
+500(R) ETF Trust").
+
+**Name matching is graded, never a silent best-guess.** A query is matched
+against `fund_name` with `ILIKE '%query%'` over a wide candidate pool, then
+ranked client-side — exact (after normalizing punctuation and generic
+suffixes like "ETF"/"Trust"/"Fund") beats a prefix match, which beats a
+plain substring match. The response always carries `name_match` and, for
+anything short of `exact`, a `name_match_note` plus `other_candidates` (each
+with its own grade) — so a contains-match is never presented as *the* fund
+without saying so. Before this, ranking fell back to whichever ILIKE
+candidate had the most recent `report_ending_period`, which could and did
+pick an unrelated same-family fund over the one actually meant.
+
 ## Ticker resolution
 
 The holdings table keys on CUSIP, which is proprietary to CUSIP Global Services, so this pack does
@@ -79,7 +142,7 @@ alongside NVIDIA and ranks them together. Same discipline as the 13F pack, delib
 
 ## Source
 
-SEC Form N-PORT data sets — https://www.sec.gov/data-research/sec-markets-data/form-n-port-data-sets
+SEC Form N-PORT structured data (holdings) and SEC Form N-CEN structured data (fund profile) — both published by the U.S. Securities and Exchange Commission.
 
 ## Quick Start
 
@@ -125,7 +188,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1683+ data sources. The
+Both URLs reach the same gateway and the same 1831+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
