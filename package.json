@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-sec-nport",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "SEC Form N-PORT — fund and ETF holdings, asked security-first.",
   "type": "module",
   "main": "lib/index.js",
@@ -27,7 +27,7 @@
     "mode": "gateway",
     "slug": "sec-nport",
     "gatewaySlug": "sec-nport",
-    "sourceHash": "v1-f62b0e666a4211762f540e08a15b505094ffc883bed463c49eb26b3d2d0a20d5",
-    "sourceCommit": "f47d581679e1e887373df51ba623f891fbe4c464"
+    "sourceHash": "v1-87b655b7f8325a83609aa9b20a547e9e108e126c43c55058f692f37f0b8496a3",
+    "sourceCommit": "8fc802aa5e23be625ce08d97178f5676c7bc93f3"
   }
 }
